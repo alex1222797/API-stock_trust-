@@ -1,0 +1,28 @@
+# Variables privadas
+.env
+.env.*
+!.env.example
+
+# Certificado local
+ca.pem
+*.key
+
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+
+# Editores
+.idea/
+.vscode/
+
+# Sistema operativo
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
