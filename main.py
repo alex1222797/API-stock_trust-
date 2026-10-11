@@ -6,6 +6,8 @@ usuarios de la aplicación de escritorio mediante tokens JWT.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import html
@@ -171,6 +173,35 @@ def obtener_sesion_actual(
         ) from error
 
 
+def requerir_administrador(
+    sesion: dict = Depends(obtener_sesion_actual),
+) -> dict:
+    if str(sesion.get("rol", "")).lower() != "administrador":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Esta operacion requiere una cuenta administradora.",
+        )
+    return sesion
+
+
+def preparar_esquema_usuarios() -> None:
+    """Ajusta únicamente la columna de fotografía para admitir imágenes pequeñas."""
+    conexion = None
+    cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SHOW COLUMNS FROM usuarios LIKE 'foto'")
+        columna = cursor.fetchone()
+        if columna is not None and "text" not in str(columna.get("Type", "")).lower():
+            cursor.execute("ALTER TABLE usuarios MODIFY foto MEDIUMTEXT NULL")
+            conexion.commit()
+            logger.info("Columna usuarios.foto preparada para imagenes remotas.")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
 # =============================================================================
 # NORMALIZACION Y VALIDACION
 # =============================================================================
@@ -185,6 +216,24 @@ def limpiar_documento(valor: str) -> str:
 
 PATRON_TELEFONO_SV = re.compile(r"^(?:\+503[\s-]?)?[267]\d{3}-?\d{4}$")
 PATRON_DUI = re.compile(r"^\d{8}-\d$")
+
+
+def validar_foto_data_uri(valor: Optional[str]) -> Optional[str]:
+    if not valor:
+        return None
+    coincidencia = re.fullmatch(
+        r"data:image/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)",
+        valor,
+    )
+    if coincidencia is None:
+        raise ValueError("La fotografia no tiene un formato valido.")
+    try:
+        contenido = base64.b64decode(coincidencia.group(2), validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise ValueError("La fotografia no contiene datos validos.") from error
+    if len(contenido) > 900_000:
+        raise ValueError("La fotografia no debe superar 900 KB.")
+    return valor
 
 
 # =============================================================================
@@ -328,6 +377,105 @@ class CredencialesLogin(BaseModel):
         return dui
 
 
+class DatosEmpleado(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nombre: str = Field(min_length=2, max_length=60)
+    apellido: str = Field(min_length=2, max_length=60)
+    dui: str = Field(min_length=10, max_length=10)
+    correo: EmailStr
+    telefono: str = Field(min_length=8, max_length=20)
+    direccion: str = Field(min_length=5, max_length=255)
+    contrasena_temporal: str = Field(min_length=10, max_length=72)
+    foto: Optional[str] = Field(default=None, max_length=1_500_000)
+
+    @field_validator("nombre", "apellido", "direccion", mode="before")
+    @classmethod
+    def normalizar_textos(cls, valor):
+        return limpiar_espacios(valor) if isinstance(valor, str) else valor
+
+    @field_validator("dui")
+    @classmethod
+    def validar_dui(cls, valor: str):
+        dui = valor.strip()
+        if not PATRON_DUI.fullmatch(dui):
+            raise ValueError("El DUI debe tener el formato 00000000-0.")
+        return dui
+
+    @field_validator("telefono")
+    @classmethod
+    def validar_telefono(cls, valor: str):
+        telefono = valor.strip()
+        if not PATRON_TELEFONO_SV.fullmatch(telefono):
+            raise ValueError("Ingresa un telefono salvadoreno valido.")
+        return telefono
+
+    @field_validator("foto")
+    @classmethod
+    def validar_foto(cls, valor: Optional[str]):
+        return validar_foto_data_uri(valor)
+
+
+class ActualizarEmpleado(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nombre: str = Field(min_length=2, max_length=60)
+    apellido: str = Field(min_length=2, max_length=60)
+    dui: str = Field(min_length=10, max_length=10)
+    correo: EmailStr
+    telefono: str = Field(min_length=8, max_length=20)
+    direccion: str = Field(min_length=5, max_length=255)
+    estado: str
+    foto: Optional[str] = Field(default=None, max_length=1_500_000)
+
+    @field_validator("nombre", "apellido", "direccion", mode="before")
+    @classmethod
+    def normalizar_textos(cls, valor):
+        return limpiar_espacios(valor) if isinstance(valor, str) else valor
+
+    @field_validator("dui")
+    @classmethod
+    def validar_dui(cls, valor: str):
+        dui = valor.strip()
+        if not PATRON_DUI.fullmatch(dui):
+            raise ValueError("El DUI debe tener el formato 00000000-0.")
+        return dui
+
+    @field_validator("telefono")
+    @classmethod
+    def validar_telefono(cls, valor: str):
+        telefono = valor.strip()
+        if not PATRON_TELEFONO_SV.fullmatch(telefono):
+            raise ValueError("Ingresa un telefono salvadoreno valido.")
+        return telefono
+
+    @field_validator("estado")
+    @classmethod
+    def validar_estado(cls, valor: str):
+        estado_usuario = valor.strip().lower()
+        if estado_usuario not in {"activo", "inactivo"}:
+            raise ValueError("El estado debe ser activo o inactivo.")
+        return estado_usuario
+
+    @field_validator("foto")
+    @classmethod
+    def validar_foto(cls, valor: Optional[str]):
+        return validar_foto_data_uri(valor)
+
+
+class CambioEstadoUsuario(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    estado: str
+
+    @field_validator("estado")
+    @classmethod
+    def validar_estado(cls, valor: str):
+        estado_usuario = valor.strip().lower()
+        if estado_usuario not in {"activo", "inactivo"}:
+            raise ValueError("El estado debe ser activo o inactivo.")
+        return estado_usuario
+
+
 # =============================================================================
 # CORREO
 # =============================================================================
@@ -465,6 +613,96 @@ Sitio oficial: https://stocktrustinfo.netlify.app/
         )
 
 
+def enviar_correo_credenciales_empleado(
+    destinatario: str,
+    nombre: str,
+    empresa: str,
+    dui: str,
+    contrasena_temporal: str,
+    fecha_expiracion: datetime,
+) -> tuple[bool, Optional[str]]:
+    if not BREVO_CONFIG["api_key"] or not BREVO_CONFIG["sender_email"]:
+        return False, "El servicio de correo no esta configurado."
+
+    vencimiento = fecha_expiracion.strftime("%d/%m/%Y a las %I:%M %p")
+    nombre_seguro = html.escape(nombre)
+    empresa_segura = html.escape(empresa)
+    dui_seguro = html.escape(dui)
+    clave_segura = html.escape(contrasena_temporal)
+    vencimiento_seguro = html.escape(vencimiento)
+
+    texto = f"""Hola, {nombre}.
+
+Se creo tu cuenta de empleado para {empresa} en StockTrust.
+
+Usuario (DUI): {dui}
+Contrasena temporal: {contrasena_temporal}
+Vencimiento: {vencimiento}
+
+Al iniciar sesion deberas crear una contrasena personal.
+No compartas estas credenciales.
+"""
+
+    contenido_html = f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;background:#eef3f7;font-family:Arial,sans-serif;color:#112b45">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+    <tr><td align="center" style="padding:32px 16px">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0"
+             style="max-width:600px;width:100%;background:#fff;border-radius:18px;overflow:hidden">
+        <tr><td style="background:#112b45;padding:28px 34px;color:#fff">
+          <h1 style="margin:0;font-size:28px">StockTrust</h1>
+          <p style="margin:6px 0 0;color:#d8e7f5">Tu cuenta de empleado esta lista.</p>
+        </td></tr>
+        <tr><td style="padding:34px">
+          <h2 style="margin:0 0 14px">Hola, {nombre_seguro}</h2>
+          <p style="line-height:1.7">Se creo tu acceso para <strong>{empresa_segura}</strong>.</p>
+          <div style="border-left:4px solid #ee6c2b;background:#f4f7fa;padding:18px;margin:24px 0">
+            <p style="margin:0 0 9px"><strong>Usuario:</strong> {dui_seguro}</p>
+            <p style="margin:0 0 9px"><strong>Contrasena temporal:</strong> {clave_segura}</p>
+            <p style="margin:0"><strong>Vence:</strong> {vencimiento_seguro}</p>
+          </div>
+          <p style="line-height:1.7">Al iniciar sesion deberas reemplazarla por una contrasena personal.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    try:
+        respuesta = requests.post(
+            BREVO_CONFIG["url"],
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_CONFIG["api_key"],
+                "content-type": "application/json",
+            },
+            json={
+                "sender": {
+                    "name": BREVO_CONFIG["sender_name"],
+                    "email": BREVO_CONFIG["sender_email"],
+                },
+                "to": [{"email": destinatario, "name": nombre}],
+                "subject": "Tus credenciales temporales de StockTrust",
+                "textContent": texto,
+                "htmlContent": contenido_html,
+            },
+            timeout=BREVO_CONFIG["timeout"],
+        )
+        if 200 <= respuesta.status_code < 300:
+            return True, None
+        logger.error(
+            "Brevo rechazo las credenciales del empleado. Codigo %s: %s",
+            respuesta.status_code,
+            respuesta.text[:500],
+        )
+        return False, "Brevo rechazo el envio de las credenciales."
+    except requests.RequestException as error:
+        logger.exception("No se pudieron enviar las credenciales: %s", error)
+        return False, "No fue posible conectar con el servicio de correo."
+
+
 def generar_codigo_empresa(cursor) -> str:
     caracteres = string.ascii_uppercase + string.digits
     anio_actual = datetime.now().year
@@ -501,6 +739,11 @@ async def lifespan(_app: FastAPI):
         if conexion is not None and conexion.is_connected():
             conexion.close()
 
+    try:
+        preparar_esquema_usuarios()
+    except Error as error:
+        logger.error("No se pudo preparar la tabla usuarios: %s", error)
+
     if not JWT_SECRET:
         logger.warning("JWT_SECRET no esta configurada; el login no emitira tokens.")
     yield
@@ -509,7 +752,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="StockTrust API",
     description="API de registro y autenticacion para StockTrust.",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -544,7 +787,7 @@ app.add_middleware(
 def inicio():
     return {
         "aplicacion": "StockTrust API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "documentacion": "/docs",
     }
 
@@ -725,6 +968,400 @@ def consultar_sesion(sesion: dict = Depends(obtener_sesion_actual)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No fue posible consultar la sesion.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+# =============================================================================
+# ADMINISTRACION DE EMPLEADOS
+# =============================================================================
+
+@app.get("/api/admin/resumen")
+def consultar_resumen_admin(
+    sesion: dict = Depends(requerir_administrador),
+):
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(rol = 'empleado' AND estado = 'activo'), 0) AS empleados,
+                COALESCE(SUM(rol = 'administrador'), 0) AS administradores,
+                COALESCE(SUM(debe_cambiar_contrasena = 1), 0) AS pendientes
+            FROM usuarios
+            WHERE id_empresa = %s
+            """,
+            (sesion["id_empresa"],),
+        )
+        resumen = cursor.fetchone() or {}
+        cursor.execute(
+            """
+            SELECT id_usuario, nombre, apellido, dui, rol, estado, fecha_creacion
+            FROM usuarios
+            WHERE id_empresa = %s
+            ORDER BY id_usuario DESC
+            LIMIT 7
+            """,
+            (sesion["id_empresa"],),
+        )
+        recientes = cursor.fetchall()
+        for usuario in recientes:
+            fecha = usuario.get("fecha_creacion")
+            usuario["fecha_creacion"] = fecha.isoformat() if fecha else None
+        return {
+            "resumen": {clave: int(valor or 0) for clave, valor in resumen.items()},
+            "recientes": recientes,
+        }
+    except Error as error:
+        logger.exception("No se pudo cargar el resumen administrativo")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible cargar el resumen administrativo.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.get("/api/usuarios")
+def listar_usuarios(
+    q: str = "",
+    sesion: dict = Depends(requerir_administrador),
+):
+    conexion = cursor = None
+    try:
+        termino = f"%{q.strip()}%"
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id_usuario, nombre, apellido, dui, correo, rol, estado,
+                   debe_cambiar_contrasena, fecha_creacion
+            FROM usuarios
+            WHERE id_empresa = %s
+              AND rol = 'empleado'
+              AND (
+                    CONCAT(nombre, ' ', apellido) LIKE %s
+                    OR dui LIKE %s
+                    OR correo LIKE %s
+                  )
+            ORDER BY nombre, apellido
+            """,
+            (sesion["id_empresa"], termino, termino, termino),
+        )
+        usuarios = cursor.fetchall()
+        for usuario in usuarios:
+            fecha = usuario.get("fecha_creacion")
+            usuario["fecha_creacion"] = fecha.isoformat() if fecha else None
+            usuario["debe_cambiar_contrasena"] = bool(
+                usuario.get("debe_cambiar_contrasena")
+            )
+        return {"usuarios": usuarios}
+    except Error as error:
+        logger.exception("No se pudieron listar los usuarios")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible cargar los usuarios.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.get("/api/usuarios/{id_usuario}")
+def consultar_usuario(
+    id_usuario: int,
+    sesion: dict = Depends(requerir_administrador),
+):
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id_usuario, nombre, apellido, dui, correo, direccion, foto,
+                   nombre_usuario, rol, telefono, estado,
+                   debe_cambiar_contrasena, fecha_expiracion_temporal,
+                   fecha_creacion, contrasena_actualizada_en
+            FROM usuarios
+            WHERE id_usuario = %s AND id_empresa = %s
+            LIMIT 1
+            """,
+            (id_usuario, sesion["id_empresa"]),
+        )
+        usuario = cursor.fetchone()
+        if usuario is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="El usuario no existe dentro de tu empresa.",
+            )
+        for campo in (
+            "fecha_expiracion_temporal",
+            "fecha_creacion",
+            "contrasena_actualizada_en",
+        ):
+            fecha = usuario.get(campo)
+            usuario[campo] = fecha.isoformat() if fecha else None
+        usuario["debe_cambiar_contrasena"] = bool(
+            usuario.get("debe_cambiar_contrasena")
+        )
+        return {"usuario": usuario}
+    except HTTPException:
+        raise
+    except Error as error:
+        logger.exception("No se pudo consultar el usuario")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible consultar el usuario.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.post("/api/usuarios", status_code=status.HTTP_201_CREATED)
+def crear_empleado(
+    datos: DatosEmpleado,
+    sesion: dict = Depends(requerir_administrador),
+):
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        conexion.autocommit = False
+        cursor = conexion.cursor(dictionary=True)
+        conexion.start_transaction()
+
+        correo = str(datos.correo).lower()
+        cursor.execute(
+            """
+            SELECT id_usuario
+            FROM usuarios
+            WHERE dui = %s OR correo = %s OR nombre_usuario = %s
+            LIMIT 1
+            """,
+            (datos.dui, correo, datos.dui),
+        )
+        if cursor.fetchone() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El DUI o correo ya se encuentra registrado.",
+            )
+
+        cursor.execute(
+            "SELECT nombre_comercial FROM empresas WHERE id_empresa = %s LIMIT 1",
+            (sesion["id_empresa"],),
+        )
+        empresa = cursor.fetchone()
+        if empresa is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No se encontro la empresa de la sesion.",
+            )
+
+        expiracion = datetime.now() + timedelta(hours=24)
+        cursor.execute(
+            """
+            INSERT INTO usuarios (
+                id_empresa, nombre, apellido, dui, correo, telefono, direccion,
+                foto, nombre_usuario, contrasena_hash, rol, estado,
+                debe_cambiar_contrasena, fecha_expiracion_temporal
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'empleado', 'activo', TRUE, %s
+            )
+            """,
+            (
+                sesion["id_empresa"],
+                datos.nombre,
+                datos.apellido,
+                datos.dui,
+                correo,
+                datos.telefono,
+                datos.direccion,
+                datos.foto,
+                datos.dui,
+                generar_hash_contrasena(datos.contrasena_temporal),
+                expiracion,
+            ),
+        )
+        id_usuario = cursor.lastrowid
+
+        enviado, aviso = enviar_correo_credenciales_empleado(
+            destinatario=correo,
+            nombre=datos.nombre,
+            empresa=empresa["nombre_comercial"],
+            dui=datos.dui,
+            contrasena_temporal=datos.contrasena_temporal,
+            fecha_expiracion=expiracion,
+        )
+        if not enviado:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=aviso or "No se pudieron enviar las credenciales.",
+            )
+
+        conexion.commit()
+        return {
+            "mensaje": "Empleado registrado y credenciales enviadas correctamente.",
+            "id_usuario": id_usuario,
+            "correo_enviado": True,
+            "correo_destino": correo,
+        }
+    except HTTPException:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        raise
+    except IntegrityError as error:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El DUI o correo ya se encuentra registrado.",
+        ) from error
+    except Error as error:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        logger.exception("No se pudo crear el empleado")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible registrar al empleado.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.put("/api/usuarios/{id_usuario}")
+def actualizar_empleado(
+    id_usuario: int,
+    datos: ActualizarEmpleado,
+    sesion: dict = Depends(requerir_administrador),
+):
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            """
+            SELECT id_usuario, rol, foto
+            FROM usuarios
+            WHERE id_usuario = %s AND id_empresa = %s
+            LIMIT 1
+            """,
+            (id_usuario, sesion["id_empresa"]),
+        )
+        actual = cursor.fetchone()
+        if actual is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="El empleado no existe dentro de tu empresa.",
+            )
+        if str(actual["rol"]).lower() != "empleado":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Este modulo solo permite editar empleados.",
+            )
+
+        foto = datos.foto if datos.foto is not None else actual.get("foto")
+        cursor.execute(
+            """
+            UPDATE usuarios
+            SET nombre = %s, apellido = %s, dui = %s, correo = %s,
+                telefono = %s, direccion = %s, foto = %s,
+                nombre_usuario = %s, estado = %s
+            WHERE id_usuario = %s AND id_empresa = %s AND rol = 'empleado'
+            """,
+            (
+                datos.nombre,
+                datos.apellido,
+                datos.dui,
+                str(datos.correo).lower(),
+                datos.telefono,
+                datos.direccion,
+                foto,
+                datos.dui,
+                datos.estado,
+                id_usuario,
+                sesion["id_empresa"],
+            ),
+        )
+        conexion.commit()
+        return {"mensaje": "Empleado actualizado correctamente."}
+    except HTTPException:
+        raise
+    except IntegrityError as error:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El DUI o correo ya pertenece a otro usuario.",
+        ) from error
+    except Error as error:
+        logger.exception("No se pudo actualizar el empleado")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible actualizar el empleado.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.patch("/api/usuarios/{id_usuario}/estado")
+def cambiar_estado_empleado(
+    id_usuario: int,
+    datos: CambioEstadoUsuario,
+    sesion: dict = Depends(requerir_administrador),
+):
+    if id_usuario == sesion["id_usuario"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No puedes desactivar la cuenta con la sesion activa.",
+        )
+
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        cursor = conexion.cursor()
+        cursor.execute(
+            """
+            UPDATE usuarios
+            SET estado = %s
+            WHERE id_usuario = %s AND id_empresa = %s AND rol = 'empleado'
+            """,
+            (datos.estado, id_usuario, sesion["id_empresa"]),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="El empleado no existe dentro de tu empresa.",
+            )
+        conexion.commit()
+        return {"mensaje": f"Empleado marcado como {datos.estado}."}
+    except HTTPException:
+        raise
+    except Error as error:
+        logger.exception("No se pudo cambiar el estado del empleado")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible cambiar el estado del empleado.",
         ) from error
     finally:
         if cursor is not None:
