@@ -13,12 +13,11 @@ import logging
 import os
 import re
 import secrets
-import smtplib
-import ssl
+import requests
 import string
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
+
 from typing import Optional
 
 import jwt
@@ -64,15 +63,12 @@ mysql_ssl_ca = os.getenv("MYSQL_SSL_CA", "").strip()
 if mysql_ssl_ca:
     DB_CONFIG.update({"ssl_ca": mysql_ssl_ca, "ssl_verify_cert": True})
 
-SMTP_CONFIG = {
-    "host": os.getenv("SMTP_HOST", "smtp.gmail.com").strip(),
-    "port": int(os.getenv("SMTP_PORT", "587")),
-    "user": os.getenv("STOCKTRUST_EMAIL", "").strip(),
-    "password": os.getenv("STOCKTRUST_EMAIL_PASSWORD", "")
-    .replace(" ", "")
-    .strip(),
-    "from_name": os.getenv("STOCKTRUST_EMAIL_FROM_NAME", "StockTrust").strip(),
-    "timeout": int(os.getenv("SMTP_TIMEOUT", "20")),
+BREVO_CONFIG = {
+    "url": "https://api.brevo.com/v3/smtp/email",
+    "api_key": os.getenv("BREVO_API_KEY", "").strip(),
+    "sender_email": os.getenv("BREVO_SENDER_EMAIL", "").strip(),
+    "sender_name": os.getenv("BREVO_SENDER_NAME", "StockTrust").strip(),
+    "timeout": int(os.getenv("BREVO_TIMEOUT", "20")),
 }
 
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
@@ -336,7 +332,6 @@ class CredencialesLogin(BaseModel):
 # =============================================================================
 # CORREO
 # =============================================================================
-
 def enviar_correo_bienvenida(
     destinatario: str,
     nombre_administrador: str,
@@ -344,8 +339,13 @@ def enviar_correo_bienvenida(
     codigo_empresa: str,
     usuario: str,
 ) -> tuple[bool, Optional[str]]:
-    if not SMTP_CONFIG["user"] or not SMTP_CONFIG["password"]:
-        aviso = "La cuenta se creo, pero el correo no esta configurado."
+    if not BREVO_CONFIG["api_key"]:
+        aviso = "La cuenta se creó, pero Brevo no está configurado."
+        logger.warning(aviso)
+        return False, aviso
+
+    if not BREVO_CONFIG["sender_email"]:
+        aviso = "La cuenta se creó, pero falta configurar el correo remitente."
         logger.warning(aviso)
         return False, aviso
 
@@ -354,78 +354,272 @@ def enviar_correo_bienvenida(
     codigo_seguro = html.escape(codigo_empresa)
     usuario_seguro = html.escape(usuario)
 
-    mensaje = EmailMessage()
-    mensaje["Subject"] = "Bienvenido a StockTrust"
-    mensaje["From"] = f'{SMTP_CONFIG["from_name"]} <{SMTP_CONFIG["user"]}>'
-    mensaje["To"] = destinatario
-    mensaje.set_content(
-        f"""Hola, {nombre_administrador}.
+    asunto = "Bienvenido a StockTrust"
+
+    contenido_texto = f"""Hola, {nombre_administrador}.
 
 La empresa {nombre_empresa} fue registrada correctamente en StockTrust.
 
-Codigo de empresa: {codigo_empresa}
+Código de empresa: {codigo_empresa}
 Usuario administrador: {usuario}
 
-Utiliza la contrasena que creaste durante el registro. Por seguridad, nunca
-enviamos ni mostramos tu contrasena por correo.
+Para iniciar sesión utiliza la contraseña que creaste durante el registro.
 
-Sitio oficial: https://stocktrustinfo.netlify.app/
+Por seguridad, StockTrust nunca envía tu contraseña en texto visible.
+
+Sitio oficial:
+https://stocktrustinfo.netlify.app/
 """
-    )
-    mensaje.add_alternative(
-        f"""<!doctype html>
+
+    contenido_html = f"""
+<!doctype html>
 <html lang="es">
-<body style="margin:0;background:#eef3f7;font-family:Arial,sans-serif;color:#112b45">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-    <tr><td align="center" style="padding:32px 16px">
-      <table role="presentation" width="600" cellspacing="0" cellpadding="0"
-             style="max-width:600px;width:100%;background:#fff;border-radius:18px;overflow:hidden">
-        <tr><td style="background:#112b45;padding:28px 34px;color:#fff">
-          <h1 style="margin:0;font-size:28px">StockTrust</h1>
-          <p style="margin:6px 0 0;color:#d8e7f5">Organiza. Controla. Haz crecer.</p>
-        </td></tr>
-        <tr><td style="padding:34px">
-          <h2 style="margin:0 0 14px">Bienvenido, {nombre_seguro}</h2>
-          <p style="line-height:1.7">La empresa <strong>{empresa_segura}</strong>
-             fue registrada correctamente.</p>
-          <div style="border-left:4px solid #ee6c2b;background:#f4f7fa;padding:18px;margin:24px 0">
-            <p style="margin:0 0 8px"><strong>Codigo:</strong> {codigo_seguro}</p>
-            <p style="margin:0"><strong>Usuario:</strong> {usuario_seguro}</p>
-          </div>
-          <p style="line-height:1.7">Ingresa con la contrasena que creaste en
-             el formulario. Por seguridad no se envia por correo.</p>
-          <p style="margin-top:28px">
-            <a href="https://stocktrustinfo.netlify.app/"
-               style="display:inline-block;background:#ee6c2b;color:#fff;text-decoration:none;padding:13px 22px;border-radius:9px;font-weight:bold">
-              Visitar StockTrust
-            </a>
-          </p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body style="
+    margin:0;
+    padding:0;
+    background:#eef3f7;
+    font-family:Arial,Helvetica,sans-serif;
+    color:#112b45;
+">
+    <table
+        role="presentation"
+        width="100%"
+        cellspacing="0"
+        cellpadding="0"
+        style="background:#eef3f7;"
+    >
+        <tr>
+            <td align="center" style="padding:32px 16px;">
+                <table
+                    role="presentation"
+                    width="600"
+                    cellspacing="0"
+                    cellpadding="0"
+                    style="
+                        width:100%;
+                        max-width:600px;
+                        overflow:hidden;
+                        border-radius:18px;
+                        background:#ffffff;
+                        box-shadow:0 15px 40px rgba(17,43,69,0.12);
+                    "
+                >
+                    <tr>
+                        <td style="
+                            padding:30px 36px;
+                            color:#ffffff;
+                            background:#112b45;
+                        ">
+                            <h1 style="
+                                margin:0;
+                                font-size:29px;
+                                line-height:1.2;
+                            ">
+                                StockTrust
+                            </h1>
+
+                            <p style="
+                                margin:7px 0 0;
+                                color:#d8e7f5;
+                                font-size:14px;
+                            ">
+                                Organiza. Controla. Haz crecer.
+                            </p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="padding:36px;">
+                            <p style="
+                                margin:0 0 8px;
+                                color:#ee6c2b;
+                                font-size:13px;
+                                font-weight:bold;
+                                letter-spacing:1px;
+                            ">
+                                REGISTRO COMPLETADO
+                            </p>
+
+                            <h2 style="
+                                margin:0 0 16px;
+                                color:#112b45;
+                                font-size:25px;
+                            ">
+                                Bienvenido, {nombre_seguro}
+                            </h2>
+
+                            <p style="
+                                margin:0;
+                                color:#52677a;
+                                font-size:15px;
+                                line-height:1.7;
+                            ">
+                                La empresa
+                                <strong>{empresa_segura}</strong>
+                                fue registrada correctamente en StockTrust.
+                            </p>
+
+                            <div style="
+                                margin:25px 0;
+                                padding:20px;
+                                border-left:5px solid #ee6c2b;
+                                border-radius:8px;
+                                background:#f4f7fa;
+                            ">
+                                <p style="
+                                    margin:0 0 11px;
+                                    color:#112b45;
+                                ">
+                                    <strong>Código de empresa:</strong>
+                                    {codigo_seguro}
+                                </p>
+
+                                <p style="
+                                    margin:0;
+                                    color:#112b45;
+                                ">
+                                    <strong>Usuario administrador:</strong>
+                                    {usuario_seguro}
+                                </p>
+                            </div>
+
+                            <p style="
+                                margin:0;
+                                color:#52677a;
+                                font-size:14px;
+                                line-height:1.7;
+                            ">
+                                Para iniciar sesión utiliza la contraseña que
+                                elegiste durante el registro.
+                            </p>
+
+                            <p style="
+                                margin:12px 0 0;
+                                color:#52677a;
+                                font-size:14px;
+                                line-height:1.7;
+                            ">
+                                Por seguridad, StockTrust nunca envía ni
+                                muestra tu contraseña en texto visible.
+                            </p>
+
+                            <p style="margin:28px 0 0;">
+                                <a
+                                    href="https://stocktrustinfo.netlify.app/"
+                                    style="
+                                        display:inline-block;
+                                        padding:14px 23px;
+                                        border-radius:10px;
+                                        color:#ffffff;
+                                        background:#ee6c2b;
+                                        font-size:14px;
+                                        font-weight:bold;
+                                        text-decoration:none;
+                                    "
+                                >
+                                    Visitar StockTrust
+                                </a>
+                            </p>
+                        </td>
+                    </tr>
+
+                    <tr>
+                        <td style="
+                            padding:20px 36px;
+                            color:#718293;
+                            background:#f4f7fa;
+                            font-size:12px;
+                            line-height:1.6;
+                        ">
+                            Este correo fue enviado automáticamente porque
+                            registraste una empresa en StockTrust.
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
 </body>
-</html>""",
-        subtype="html",
-    )
+</html>
+"""
 
-    contexto = ssl.create_default_context()
+    encabezados = {
+        "accept": "application/json",
+        "api-key": BREVO_CONFIG["api_key"],
+        "content-type": "application/json",
+    }
+
+    datos_correo = {
+        "sender": {
+            "name": BREVO_CONFIG["sender_name"],
+            "email": BREVO_CONFIG["sender_email"],
+        },
+        "to": [
+            {
+                "email": destinatario,
+                "name": nombre_administrador,
+            }
+        ],
+        "replyTo": {
+            "email": BREVO_CONFIG["sender_email"],
+            "name": BREVO_CONFIG["sender_name"],
+        },
+        "subject": asunto,
+        "textContent": contenido_texto,
+        "htmlContent": contenido_html,
+    }
+
     try:
-        with smtplib.SMTP(
-            SMTP_CONFIG["host"],
-            SMTP_CONFIG["port"],
-            timeout=SMTP_CONFIG["timeout"],
-        ) as servidor:
-            servidor.ehlo()
-            servidor.starttls(context=contexto)
-            servidor.ehlo()
-            servidor.login(SMTP_CONFIG["user"], SMTP_CONFIG["password"])
-            servidor.send_message(mensaje)
-        return True, None
-    except (smtplib.SMTPException, OSError) as error:
-        logger.exception("No se pudo enviar el correo de bienvenida: %s", error)
-        return False, "La cuenta se creo, pero no se pudo enviar el correo."
+        respuesta = requests.post(
+            BREVO_CONFIG["url"],
+            headers=encabezados,
+            json=datos_correo,
+            timeout=BREVO_CONFIG["timeout"],
+        )
 
+        if 200 <= respuesta.status_code < 300:
+            logger.info(
+                "Correo de bienvenida enviado correctamente a %s.",
+                destinatario,
+            )
+            return True, None
+
+        logger.error(
+            "Brevo rechazó el correo. Código %s: %s",
+            respuesta.status_code,
+            respuesta.text[:500],
+        )
+
+        return (
+            False,
+            "La cuenta se creó, pero el servicio de correo rechazó el envío.",
+        )
+
+    except requests.Timeout:
+        logger.exception(
+            "Brevo tardó demasiado en responder al enviar el correo."
+        )
+
+        return (
+            False,
+            "La cuenta se creó, pero el correo tardó demasiado en enviarse.",
+        )
+
+    except requests.RequestException as error:
+        logger.exception(
+            "No se pudo conectar con la API de Brevo: %s",
+            error,
+        )
+
+        return (
+            False,
+            "La cuenta se creó, pero no se pudo conectar con el correo.",
+        )
 
 def generar_codigo_empresa(cursor) -> str:
     caracteres = string.ascii_uppercase + string.digits
