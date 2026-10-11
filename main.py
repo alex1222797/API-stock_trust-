@@ -377,6 +377,37 @@ class CredencialesLogin(BaseModel):
         return dui
 
 
+class CambioContrasenaPersonal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nueva_contrasena: str = Field(min_length=10, max_length=72)
+    confirmar_contrasena: str = Field(min_length=10, max_length=72)
+
+    @field_validator("nueva_contrasena")
+    @classmethod
+    def validar_seguridad(cls, valor: str):
+        errores = []
+        if not re.search(r"[A-Z]", valor):
+            errores.append("una letra mayuscula")
+        if not re.search(r"[a-z]", valor):
+            errores.append("una letra minuscula")
+        if not re.search(r"\d", valor):
+            errores.append("un numero")
+        if not re.search(r"[^A-Za-z0-9]", valor):
+            errores.append("un caracter especial")
+        if errores:
+            raise ValueError(
+                "La nueva contrasena debe incluir " + ", ".join(errores) + "."
+            )
+        return valor
+
+    @model_validator(mode="after")
+    def comprobar_coincidencia(self):
+        if self.nueva_contrasena != self.confirmar_contrasena:
+            raise ValueError("Las contrasenas no coinciden.")
+        return self
+
+
 class DatosEmpleado(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -703,6 +734,79 @@ No compartas estas credenciales.
         return False, "No fue posible conectar con el servicio de correo."
 
 
+def enviar_correo_cambio_contrasena(
+    destinatarios: list[str],
+    nombre: str,
+    dui: str,
+) -> tuple[bool, Optional[str]]:
+    """Notifica el cambio sin revelar ni transportar la nueva contraseña."""
+    correos = []
+    for correo in destinatarios:
+        correo_limpio = str(correo or "").strip().lower()
+        if correo_limpio and correo_limpio not in correos:
+            correos.append(correo_limpio)
+    if not correos:
+        return True, None
+    if not BREVO_CONFIG["api_key"] or not BREVO_CONFIG["sender_email"]:
+        return False, "El servicio de notificaciones no esta configurado."
+
+    dui_oculto = f"********-{dui[-1]}" if dui else "No disponible"
+    momento = datetime.now().strftime("%d/%m/%Y a las %I:%M %p")
+    contenido = f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;background:#eef3f7;font-family:Arial,sans-serif;color:#112b45">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+    <tr><td align="center" style="padding:32px 16px">
+      <table role="presentation" width="600" cellspacing="0" cellpadding="0"
+             style="max-width:600px;width:100%;background:#fff;border-radius:18px;overflow:hidden">
+        <tr><td style="background:#112b45;padding:28px 34px;color:#fff">
+          <h1 style="margin:0;font-size:28px">StockTrust</h1>
+          <p style="margin:6px 0 0;color:#d8e7f5">Notificacion de seguridad</p>
+        </td></tr>
+        <tr><td style="padding:34px">
+          <h2 style="margin:0 0 14px">Contrasena actualizada</h2>
+          <p style="line-height:1.7">{html.escape(nombre)} ({html.escape(dui_oculto)})
+             configuro su contrasena personal el {html.escape(momento)}.</p>
+          <p style="line-height:1.7;color:#60758a">Por seguridad, StockTrust nunca
+             incluye la nueva contrasena en este mensaje.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+    try:
+        respuesta = requests.post(
+            BREVO_CONFIG["url"],
+            headers={
+                "accept": "application/json",
+                "api-key": BREVO_CONFIG["api_key"],
+                "content-type": "application/json",
+            },
+            json={
+                "sender": {
+                    "name": BREVO_CONFIG["sender_name"],
+                    "email": BREVO_CONFIG["sender_email"],
+                },
+                "to": [{"email": correo} for correo in correos],
+                "subject": "Contrasena actualizada en StockTrust",
+                "htmlContent": contenido,
+            },
+            timeout=BREVO_CONFIG["timeout"],
+        )
+        if 200 <= respuesta.status_code < 300:
+            return True, None
+        logger.error(
+            "Brevo rechazo la notificacion de cambio. Codigo %s: %s",
+            respuesta.status_code,
+            respuesta.text[:500],
+        )
+        return False, "El cambio se guardo, pero el correo fue rechazado."
+    except requests.RequestException as error:
+        logger.exception("No se pudo notificar el cambio: %s", error)
+        return False, "El cambio se guardo, pero no se pudo enviar la notificacion."
+
+
 def generar_codigo_empresa(cursor) -> str:
     caracteres = string.ascii_uppercase + string.digits
     anio_actual = datetime.now().year
@@ -752,7 +856,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="StockTrust API",
     description="API de registro y autenticacion para StockTrust.",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -787,7 +891,7 @@ app.add_middleware(
 def inicio():
     return {
         "aplicacion": "StockTrust API",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "documentacion": "/docs",
     }
 
@@ -968,6 +1072,101 @@ def consultar_sesion(sesion: dict = Depends(obtener_sesion_actual)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No fue posible consultar la sesion.",
+        ) from error
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conexion is not None and conexion.is_connected():
+            conexion.close()
+
+
+@app.post("/api/auth/cambiar-contrasena")
+def cambiar_contrasena_personal(
+    datos: CambioContrasenaPersonal,
+    sesion: dict = Depends(obtener_sesion_actual),
+):
+    conexion = cursor = None
+    try:
+        conexion = obtener_conexion()
+        conexion.autocommit = False
+        cursor = conexion.cursor(dictionary=True)
+        conexion.start_transaction()
+        cursor.execute(
+            """
+            SELECT id_usuario, nombre, apellido, dui, correo, contrasena_hash,
+                   estado, debe_cambiar_contrasena
+            FROM usuarios
+            WHERE id_usuario = %s AND id_empresa = %s
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (sesion["id_usuario"], sesion["id_empresa"]),
+        )
+        usuario = cursor.fetchone()
+        if usuario is None or str(usuario["estado"]).lower() != "activo":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="La cuenta ya no se encuentra disponible.",
+            )
+        if verificar_hash_contrasena(
+            datos.nueva_contrasena,
+            usuario["contrasena_hash"],
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="La nueva contrasena debe ser diferente de la temporal.",
+            )
+
+        cursor.execute(
+            """
+            UPDATE usuarios
+            SET contrasena_hash = %s,
+                debe_cambiar_contrasena = FALSE,
+                fecha_expiracion_temporal = NULL,
+                contrasena_actualizada_en = NOW()
+            WHERE id_usuario = %s AND id_empresa = %s
+            """,
+            (
+                generar_hash_contrasena(datos.nueva_contrasena),
+                sesion["id_usuario"],
+                sesion["id_empresa"],
+            ),
+        )
+        cursor.execute(
+            """
+            SELECT correo
+            FROM usuarios
+            WHERE id_empresa = %s AND rol = 'administrador' AND estado = 'activo'
+            ORDER BY id_usuario
+            LIMIT 1
+            """,
+            (sesion["id_empresa"],),
+        )
+        administrador = cursor.fetchone() or {}
+        conexion.commit()
+
+        enviado, aviso = enviar_correo_cambio_contrasena(
+            [usuario.get("correo"), administrador.get("correo")],
+            f"{usuario['nombre']} {usuario['apellido']}".strip(),
+            usuario.get("dui") or "",
+        )
+        return {
+            "mensaje": "Tu contrasena personal fue guardada correctamente.",
+            "debe_cambiar_contrasena": False,
+            "correo_enviado": enviado,
+            "aviso": aviso,
+        }
+    except HTTPException:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        raise
+    except Error as error:
+        if conexion is not None and conexion.is_connected():
+            conexion.rollback()
+        logger.exception("No se pudo cambiar la contrasena del usuario")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No fue posible actualizar la contrasena.",
         ) from error
     finally:
         if cursor is not None:
