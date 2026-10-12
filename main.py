@@ -203,14 +203,26 @@ def requerir_administrador(
 
 
 def preparar_esquema_usuarios():
-    conexion=obtener_conexion()
-    cursor=conexion.cursor()
+    conexion = obtener_conexion()
+    cursor = None
+
     try:
-        cursor.execute('SELECT auth_version FROM usuarios LIMIT 0')
-        cursor.execute('SELECT id_empresa,version FROM productos LIMIT 0')
+        cursor = conexion.cursor(buffered=True)
+
+        cursor.execute(
+            "SELECT auth_version FROM usuarios LIMIT 0"
+        )
+
+        cursor.execute(
+            "SELECT id_empresa, version FROM productos LIMIT 0"
+        )
+
     finally:
-        cursor.close()
-        conexion.close()
+        try:
+            if cursor is not None:
+                cursor.close()
+        finally:
+            conexion.close()
 
 # =============================================================================
 # NORMALIZACION Y VALIDACION
