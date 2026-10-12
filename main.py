@@ -18,6 +18,10 @@ import secrets
 import string
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+
+
+def ahora_local():
+    return datetime.now(timezone(timedelta(hours=-6))).replace(tzinfo=None)
 from typing import Optional
 
 import jwt
@@ -62,7 +66,7 @@ DB_CONFIG = {
 
 mysql_ssl_ca = os.getenv("MYSQL_SSL_CA", "").strip()
 if mysql_ssl_ca:
-    DB_CONFIG.update({"ssl_ca": mysql_ssl_ca, "ssl_verify_cert": True})
+    DB_CONFIG.update({"ssl_ca": mysql_ssl_ca, "ssl_verify_cert": True, "ssl_verify_identity": True})
 
 BREVO_CONFIG = {
     "url": "https://api.brevo.com/v3/smtp/email",
@@ -82,7 +86,14 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 # =============================================================================
 
 def obtener_conexion():
-    return mysql.connector.connect(**DB_CONFIG)
+    conexion = mysql.connector.connect(**DB_CONFIG)
+    cursor = conexion.cursor()
+    try:
+        cursor.execute("SET time_zone = '-06:00'")
+    finally:
+        cursor.close()
+    return conexion
+
 
 
 def generar_hash_contrasena(contrasena: str) -> str:
@@ -115,62 +126,69 @@ def verificar_hash_contrasena(contrasena: str, hash_guardado: str) -> bool:
 
 
 def generar_token_acceso(usuario: dict) -> str:
-    if not JWT_SECRET:
-        raise RuntimeError("JWT_SECRET no esta configurada.")
-
+    if len(JWT_SECRET) < 32:
+        raise RuntimeError("JWT_SECRET debe tener al menos 32 caracteres aleatorios.")
     ahora = datetime.now(timezone.utc)
-    contenido = {
-        "sub": str(usuario["id_usuario"]),
-        "id_empresa": int(usuario["id_empresa"]),
-        "rol": str(usuario["rol"]),
-        "iat": ahora,
-        "exp": ahora + timedelta(minutes=JWT_EXPIRE_MINUTES),
-    }
-    return jwt.encode(contenido, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    temporal = bool(usuario.get('debe_cambiar_contrasena'))
+    return jwt.encode({
+        'sub': str(usuario['id_usuario']), 'id_empresa': int(usuario['id_empresa']),
+        'rol': usuario['rol'], 'ver': int(usuario.get('auth_version', 1)),
+        'scope': 'cambiar_clave' if temporal else 'app',
+        'iat': ahora, 'exp': ahora + timedelta(minutes=15 if temporal else JWT_EXPIRE_MINUTES),
+    }, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
 
 
 seguridad_http = HTTPBearer(auto_error=False)
 
 
-def obtener_sesion_actual(
+def obtener_sesion_identificada(
     credenciales: HTTPAuthorizationCredentials | None = Depends(seguridad_http),
 ) -> dict:
-    if credenciales is None or credenciales.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Debes iniciar sesion.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not JWT_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="La autenticacion no esta configurada.",
-        )
-
+    if not credenciales or credenciales.scheme.lower() != 'bearer':
+        raise HTTPException(401, 'Debes iniciar sesión.', headers={'WWW-Authenticate': 'Bearer'})
     try:
-        contenido = jwt.decode(
-            credenciales.credentials,
-            JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-        )
-        return {
-            "id_usuario": int(contenido["sub"]),
-            "id_empresa": int(contenido["id_empresa"]),
-            "rol": str(contenido["rol"]),
-        }
-    except jwt.ExpiredSignatureError as error:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="La sesion vencio. Inicia sesion nuevamente.",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from error
-    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError) as error:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="La sesion no es valida.",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from error
+        token = jwt.decode(credenciales.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+                           options={'require': ['exp','iat','sub','id_empresa','ver','scope']})
+        id_usuario, id_empresa = int(token['sub']), int(token['id_empresa'])
+    except (jwt.InvalidTokenError, ValueError, TypeError, KeyError) as error:
+        raise HTTPException(401, 'La sesión venció o no es válida. Inicia sesión nuevamente.') from error
+    conexion = cursor = None
+    try:
+        conexion=obtener_conexion()
+        cursor=conexion.cursor(dictionary=True)
+        cursor.execute("""SELECT u.id_usuario,u.id_empresa,u.rol,u.estado,u.auth_version,
+            u.debe_cambiar_contrasena,u.fecha_expiracion_temporal,e.estado estado_empresa
+            FROM usuarios u JOIN empresas e ON e.id_empresa=u.id_empresa
+            WHERE u.id_usuario=%s AND u.id_empresa=%s""",(id_usuario,id_empresa))
+        usuario=cursor.fetchone()
+        if not usuario or usuario['estado']!='activo' or usuario['estado_empresa']!='activa':
+            raise HTTPException(401,'Cuenta o empresa inactiva.')
+        if usuario['auth_version']!=token['ver']:
+            raise HTTPException(401,'La contraseña o permisos cambiaron. Inicia sesión nuevamente.')
+        usuario['scope']=token['scope']
+        if usuario['scope'] not in ('app','cambiar_clave'):
+            raise HTTPException(401,'Sesión no válida.')
+        if usuario['debe_cambiar_contrasena']:
+            fecha=usuario['fecha_expiracion_temporal']
+            if fecha is not None and ahora_local()>fecha:
+                raise HTTPException(403,'La contraseña temporal venció.')
+        return usuario
+    except Error as error:
+        logger.exception('Error al comprobar sesión')
+        raise HTTPException(503,'No se pudo verificar tu sesión.') from error
+    finally:
+        if cursor: cursor.close()
+        if conexion: conexion.close()
+
+
+def obtener_sesion_actual(sesion: dict = Depends(obtener_sesion_identificada)) -> dict:
+    if sesion['scope']!='app' or sesion['debe_cambiar_contrasena']:
+        raise HTTPException(403,'Primero debes cambiar la contraseña temporal.')
+    if sesion['rol'] not in ('administrador','empleado'):
+        raise HTTPException(403,'Rol no autorizado.')
+    return sesion
+
 
 
 def requerir_administrador(
@@ -184,24 +202,16 @@ def requerir_administrador(
     return sesion
 
 
-def preparar_esquema_usuarios() -> None:
-    """Ajusta únicamente la columna de fotografía para admitir imágenes pequeñas."""
-    conexion = None
-    cursor = None
+def preparar_esquema_usuarios():
+    conexion=obtener_conexion()
+    cursor=conexion.cursor()
     try:
-        conexion = obtener_conexion()
-        cursor = conexion.cursor(dictionary=True)
-        cursor.execute("SHOW COLUMNS FROM usuarios LIKE 'foto'")
-        columna = cursor.fetchone()
-        if columna is not None and "text" not in str(columna.get("Type", "")).lower():
-            cursor.execute("ALTER TABLE usuarios MODIFY foto MEDIUMTEXT NULL")
-            conexion.commit()
-            logger.info("Columna usuarios.foto preparada para imagenes remotas.")
+        cursor.execute('SELECT auth_version FROM usuarios LIMIT 0')
+        cursor.execute('SELECT id_empresa,version FROM productos LIMIT 0')
     finally:
-        if cursor is not None:
-            cursor.close()
-        if conexion is not None and conexion.is_connected():
-            conexion.close()
+        cursor.close()
+        conexion.close()
+
 # =============================================================================
 # NORMALIZACION Y VALIDACION
 # =============================================================================
@@ -218,22 +228,10 @@ PATRON_TELEFONO_SV = re.compile(r"^(?:\+503[\s-]?)?[267]\d{3}-?\d{4}$")
 PATRON_DUI = re.compile(r"^\d{8}-\d$")
 
 
-def validar_foto_data_uri(valor: Optional[str]) -> Optional[str]:
-    if not valor:
-        return None
-    coincidencia = re.fullmatch(
-        r"data:image/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)",
-        valor,
-    )
-    if coincidencia is None:
-        raise ValueError("La fotografia no tiene un formato valido.")
-    try:
-        contenido = base64.b64decode(coincidencia.group(2), validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError("La fotografia no contiene datos validos.") from error
-    if len(contenido) > 900_000:
-        raise ValueError("La fotografia no debe superar 900 KB.")
-    return valor
+def validar_foto_data_uri(valor):
+    from negocio_api import normalizar_imagen
+    return normalizar_imagen(valor)
+
 
 
 # =============================================================================
@@ -375,37 +373,6 @@ class CredencialesLogin(BaseModel):
         if not PATRON_DUI.fullmatch(dui):
             raise ValueError("El DUI debe tener el formato 00000000-0.")
         return dui
-
-
-class CambioContrasenaPersonal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    nueva_contrasena: str = Field(min_length=10, max_length=72)
-    confirmar_contrasena: str = Field(min_length=10, max_length=72)
-
-    @field_validator("nueva_contrasena")
-    @classmethod
-    def validar_seguridad(cls, valor: str):
-        errores = []
-        if not re.search(r"[A-Z]", valor):
-            errores.append("una letra mayuscula")
-        if not re.search(r"[a-z]", valor):
-            errores.append("una letra minuscula")
-        if not re.search(r"\d", valor):
-            errores.append("un numero")
-        if not re.search(r"[^A-Za-z0-9]", valor):
-            errores.append("un caracter especial")
-        if errores:
-            raise ValueError(
-                "La nueva contrasena debe incluir " + ", ".join(errores) + "."
-            )
-        return valor
-
-    @model_validator(mode="after")
-    def comprobar_coincidencia(self):
-        if self.nueva_contrasena != self.confirmar_contrasena:
-            raise ValueError("Las contrasenas no coinciden.")
-        return self
 
 
 class DatosEmpleado(BaseModel):
@@ -734,82 +701,9 @@ No compartas estas credenciales.
         return False, "No fue posible conectar con el servicio de correo."
 
 
-def enviar_correo_cambio_contrasena(
-    destinatarios: list[str],
-    nombre: str,
-    dui: str,
-) -> tuple[bool, Optional[str]]:
-    """Notifica el cambio sin revelar ni transportar la nueva contraseña."""
-    correos = []
-    for correo in destinatarios:
-        correo_limpio = str(correo or "").strip().lower()
-        if correo_limpio and correo_limpio not in correos:
-            correos.append(correo_limpio)
-    if not correos:
-        return True, None
-    if not BREVO_CONFIG["api_key"] or not BREVO_CONFIG["sender_email"]:
-        return False, "El servicio de notificaciones no esta configurado."
-
-    dui_oculto = f"********-{dui[-1]}" if dui else "No disponible"
-    momento = datetime.now().strftime("%d/%m/%Y a las %I:%M %p")
-    contenido = f"""<!doctype html>
-<html lang="es">
-<body style="margin:0;background:#eef3f7;font-family:Arial,sans-serif;color:#112b45">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
-    <tr><td align="center" style="padding:32px 16px">
-      <table role="presentation" width="600" cellspacing="0" cellpadding="0"
-             style="max-width:600px;width:100%;background:#fff;border-radius:18px;overflow:hidden">
-        <tr><td style="background:#112b45;padding:28px 34px;color:#fff">
-          <h1 style="margin:0;font-size:28px">StockTrust</h1>
-          <p style="margin:6px 0 0;color:#d8e7f5">Notificacion de seguridad</p>
-        </td></tr>
-        <tr><td style="padding:34px">
-          <h2 style="margin:0 0 14px">Contrasena actualizada</h2>
-          <p style="line-height:1.7">{html.escape(nombre)} ({html.escape(dui_oculto)})
-             configuro su contrasena personal el {html.escape(momento)}.</p>
-          <p style="line-height:1.7;color:#60758a">Por seguridad, StockTrust nunca
-             incluye la nueva contrasena en este mensaje.</p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
-    try:
-        respuesta = requests.post(
-            BREVO_CONFIG["url"],
-            headers={
-                "accept": "application/json",
-                "api-key": BREVO_CONFIG["api_key"],
-                "content-type": "application/json",
-            },
-            json={
-                "sender": {
-                    "name": BREVO_CONFIG["sender_name"],
-                    "email": BREVO_CONFIG["sender_email"],
-                },
-                "to": [{"email": correo} for correo in correos],
-                "subject": "Contrasena actualizada en StockTrust",
-                "htmlContent": contenido,
-            },
-            timeout=BREVO_CONFIG["timeout"],
-        )
-        if 200 <= respuesta.status_code < 300:
-            return True, None
-        logger.error(
-            "Brevo rechazo la notificacion de cambio. Codigo %s: %s",
-            respuesta.status_code,
-            respuesta.text[:500],
-        )
-        return False, "El cambio se guardo, pero el correo fue rechazado."
-    except requests.RequestException as error:
-        logger.exception("No se pudo notificar el cambio: %s", error)
-        return False, "El cambio se guardo, pero no se pudo enviar la notificacion."
-
-
 def generar_codigo_empresa(cursor) -> str:
     caracteres = string.ascii_uppercase + string.digits
-    anio_actual = datetime.now().year
+    anio_actual = ahora_local().year
 
     for _ in range(10):
         sufijo = "".join(secrets.choice(caracteres) for _ in range(6))
@@ -856,7 +750,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="StockTrust API",
     description="API de registro y autenticacion para StockTrust.",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -891,7 +785,7 @@ app.add_middleware(
 def inicio():
     return {
         "aplicacion": "StockTrust API",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "documentacion": "/docs",
     }
 
@@ -941,6 +835,7 @@ def iniciar_sesion(datos: CredencialesLogin):
                 u.correo,
                 u.nombre_usuario,
                 u.contrasena_hash,
+                u.auth_version,
                 u.rol,
                 u.estado,
                 u.debe_cambiar_contrasena,
@@ -979,7 +874,7 @@ def iniciar_sesion(datos: CredencialesLogin):
         if (
             bool(usuario.get("debe_cambiar_contrasena"))
             and expiracion is not None
-            and datetime.now() > expiracion
+            and ahora_local() > expiracion
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1072,101 +967,6 @@ def consultar_sesion(sesion: dict = Depends(obtener_sesion_actual)):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="No fue posible consultar la sesion.",
-        ) from error
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if conexion is not None and conexion.is_connected():
-            conexion.close()
-
-
-@app.post("/api/auth/cambiar-contrasena")
-def cambiar_contrasena_personal(
-    datos: CambioContrasenaPersonal,
-    sesion: dict = Depends(obtener_sesion_actual),
-):
-    conexion = cursor = None
-    try:
-        conexion = obtener_conexion()
-        conexion.autocommit = False
-        cursor = conexion.cursor(dictionary=True)
-        conexion.start_transaction()
-        cursor.execute(
-            """
-            SELECT id_usuario, nombre, apellido, dui, correo, contrasena_hash,
-                   estado, debe_cambiar_contrasena
-            FROM usuarios
-            WHERE id_usuario = %s AND id_empresa = %s
-            LIMIT 1
-            FOR UPDATE
-            """,
-            (sesion["id_usuario"], sesion["id_empresa"]),
-        )
-        usuario = cursor.fetchone()
-        if usuario is None or str(usuario["estado"]).lower() != "activo":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="La cuenta ya no se encuentra disponible.",
-            )
-        if verificar_hash_contrasena(
-            datos.nueva_contrasena,
-            usuario["contrasena_hash"],
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="La nueva contrasena debe ser diferente de la temporal.",
-            )
-
-        cursor.execute(
-            """
-            UPDATE usuarios
-            SET contrasena_hash = %s,
-                debe_cambiar_contrasena = FALSE,
-                fecha_expiracion_temporal = NULL,
-                contrasena_actualizada_en = NOW()
-            WHERE id_usuario = %s AND id_empresa = %s
-            """,
-            (
-                generar_hash_contrasena(datos.nueva_contrasena),
-                sesion["id_usuario"],
-                sesion["id_empresa"],
-            ),
-        )
-        cursor.execute(
-            """
-            SELECT correo
-            FROM usuarios
-            WHERE id_empresa = %s AND rol = 'administrador' AND estado = 'activo'
-            ORDER BY id_usuario
-            LIMIT 1
-            """,
-            (sesion["id_empresa"],),
-        )
-        administrador = cursor.fetchone() or {}
-        conexion.commit()
-
-        enviado, aviso = enviar_correo_cambio_contrasena(
-            [usuario.get("correo"), administrador.get("correo")],
-            f"{usuario['nombre']} {usuario['apellido']}".strip(),
-            usuario.get("dui") or "",
-        )
-        return {
-            "mensaje": "Tu contrasena personal fue guardada correctamente.",
-            "debe_cambiar_contrasena": False,
-            "correo_enviado": enviado,
-            "aviso": aviso,
-        }
-    except HTTPException:
-        if conexion is not None and conexion.is_connected():
-            conexion.rollback()
-        raise
-    except Error as error:
-        if conexion is not None and conexion.is_connected():
-            conexion.rollback()
-        logger.exception("No se pudo cambiar la contrasena del usuario")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="No fue posible actualizar la contrasena.",
         ) from error
     finally:
         if cursor is not None:
@@ -1370,7 +1170,7 @@ def crear_empleado(
                 detail="No se encontro la empresa de la sesion.",
             )
 
-        expiracion = datetime.now() + timedelta(hours=24)
+        expiracion = ahora_local() + timedelta(hours=24)
         cursor.execute(
             """
             INSERT INTO usuarios (
@@ -1398,6 +1198,7 @@ def crear_empleado(
         )
         id_usuario = cursor.lastrowid
 
+        conexion.commit()
         enviado, aviso = enviar_correo_credenciales_empleado(
             destinatario=correo,
             nombre=datos.nombre,
@@ -1406,17 +1207,11 @@ def crear_empleado(
             contrasena_temporal=datos.contrasena_temporal,
             fecha_expiracion=expiracion,
         )
-        if not enviado:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=aviso or "No se pudieron enviar las credenciales.",
-            )
-
-        conexion.commit()
         return {
-            "mensaje": "Empleado registrado y credenciales enviadas correctamente.",
+            "mensaje": "Empleado registrado. Revisa el resultado del envío de correo.",
+            "aviso": aviso,
             "id_usuario": id_usuario,
-            "correo_enviado": True,
+            "correo_enviado": enviado,
             "correo_destino": correo,
         }
     except HTTPException:
@@ -1482,7 +1277,7 @@ def actualizar_empleado(
             UPDATE usuarios
             SET nombre = %s, apellido = %s, dui = %s, correo = %s,
                 telefono = %s, direccion = %s, foto = %s,
-                nombre_usuario = %s, estado = %s
+                nombre_usuario = %s, estado = %s, auth_version=auth_version+1
             WHERE id_usuario = %s AND id_empresa = %s AND rol = 'empleado'
             """,
             (
@@ -1542,7 +1337,7 @@ def cambiar_estado_empleado(
         cursor.execute(
             """
             UPDATE usuarios
-            SET estado = %s
+            SET estado = %s, auth_version=auth_version+1
             WHERE id_usuario = %s AND id_empresa = %s AND rol = 'empleado'
             """,
             (datos.estado, id_usuario, sesion["id_empresa"]),
@@ -1740,3 +1535,34 @@ def registrar_empresa(datos: RegistroEmpresa):
             cursor.close()
         if conexion is not None and conexion.is_connected():
             conexion.close()
+
+
+@app.head('/')
+def cabecera():
+    return Response(status_code=200)
+
+
+def notificar_cambio(usuario, correo_admin):
+    if not BREVO_CONFIG['api_key'] or not BREVO_CONFIG['sender_email']:
+        return False
+    correcto=True
+    for correo in set(filter(None,(usuario.get('correo'),correo_admin))):
+        try:
+            respuesta=requests.post(BREVO_CONFIG['url'],headers={
+                'api-key':BREVO_CONFIG['api_key'],'Content-Type':'application/json'},json={
+                'sender':{'name':BREVO_CONFIG['sender_name'],'email':BREVO_CONFIG['sender_email']},
+                'to':[{'email':correo}], 'subject':'StockTrust: contraseña actualizada',
+                'textContent':f"{usuario['nombre']} actualizó su contraseña personal en StockTrust. "
+                    'Por seguridad, no enviamos ni mostramos la nueva contraseña. '
+                    'Si no reconoces esta acción, contacta a tu administrador.'},timeout=BREVO_CONFIG['timeout'])
+            correcto=correcto and respuesta.ok
+        except requests.RequestException:
+            correcto=False
+    return correcto
+
+
+from fastapi import Response
+from negocio_api import instalar_rutas
+instalar_rutas(app,obtener_conexion,obtener_sesion_actual,obtener_sesion_identificada,
+               requerir_administrador,generar_hash_contrasena,verificar_hash_contrasena,
+               generar_token_acceso,notificar_cambio)

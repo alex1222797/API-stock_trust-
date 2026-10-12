@@ -1,28 +1,8 @@
-# Variables privadas
 .env
-.env.*
-!.env.example
-
-# Certificado local
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
 ca.pem
 *.key
-
-# Entorno virtual
-.venv/
-venv/
-env/
-
-# Caché de Python
-__pycache__/
-*.py[cod]
-
-# Editores
-.idea/
-.vscode/
-
-# Sistema operativo
-Thumbs.db
-.DS_Store
-
-# Logs
-*.log
