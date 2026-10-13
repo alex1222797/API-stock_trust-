@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, HTTPException, Query, Response
 from mysql.connector import Error, IntegrityError
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 log = logging.getLogger('stocktrust.negocio')
@@ -92,6 +92,8 @@ class VentaDatos(Modelo):
     total_esperado: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
     metodo_pago: Literal['efectivo', 'tarjeta', 'transferencia'] = 'efectivo'
     cliente_nombre: str = Field(default='', max_length=120)
+    cliente_correo: EmailStr | None = Field(default=None, max_length=254)
+    monto_recibido: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
     borrador_revision: UUID | None = None
 
     @model_validator(mode='after')
@@ -136,7 +138,7 @@ class ClaveDatos(BaseModel):
 
 
 def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
-                   requerir_admin, crear_hash, verificar_hash, crear_token, avisar_cambio):
+                   requerir_admin, crear_hash, verificar_hash, crear_token, avisar_cambio, correo_config=None):
     @contextmanager
     def db():
         conexion = cursor = None
@@ -280,7 +282,8 @@ def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
                 if anterior['id_usuario'] != s['id_usuario'] or anterior['solicitud_hash'] != huella:
                     raise HTTPException(409,'La referencia del cobro pertenece a otra operación.')
                 return {'id_venta': anterior['id_venta'],'numero_comprobante':anterior['numero_comprobante'],
-                        'total':float(anterior['total']),'repetida': True}
+                        'total':float(anterior['total']),'monto_recibido':anterior.get('monto_recibido'),
+                        'cambio':anterior.get('cambio'), 'repetida': True}
             lineas, subtotal = [], Decimal('0.00')
             for item in sorted(datos.productos,key=lambda p:p.id_producto):
                 p = una(c,'SELECT * FROM productos WHERE id_producto=%s AND id_empresa=%s FOR UPDATE',(item.id_producto,s['id_empresa']))
@@ -299,6 +302,12 @@ def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
                 raise HTTPException(422,'El importe supera el límite de una venta.')
             if total < 0 or total != datos.total_esperado:
                 raise HTTPException(409,'Los totales cambiaron o el descuento supera el subtotal. Revisa el carrito.')
+            recibido = dinero(datos.monto_recibido if datos.monto_recibido is not None else total)
+            if recibido < total:
+                raise HTTPException(422, 'El dinero recibido no cubre el total de la compra.')
+            if datos.metodo_pago != 'efectivo' and recibido != total:
+                raise HTTPException(422, 'Sólo los pagos en efectivo pueden generar vuelto.')
+            cambio = dinero(recibido - total)
             c.execute('''INSERT INTO ventas (id_empresa,id_usuario,numero_comprobante,subtotal,
                       descuento,total,metodo_pago,estado,solicitud_id,solicitud_hash)
                       VALUES (%s,%s,%s,%s,%s,%s,%s,'completada',%s,%s)''',
@@ -307,7 +316,9 @@ def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
             id_venta = c.lastrowid
             comprobante = f'ST-{id_venta:08d}'
             c.execute('UPDATE ventas SET numero_comprobante=%s WHERE id_venta=%s',(comprobante,id_venta))
-            c.execute('UPDATE ventas SET cliente_nombre=%s WHERE id_venta=%s',(datos.cliente_nombre,id_venta))
+            c.execute('''UPDATE ventas SET cliente_nombre=%s,cliente_correo=%s,monto_recibido=%s,cambio=%s
+                WHERE id_venta=%s''', (datos.cliente_nombre, str(datos.cliente_correo) if datos.cliente_correo else None,
+                                      recibido, cambio, id_venta))
             for p,cantidad,precio,importe in lineas:
                 c.execute('''INSERT INTO detalle_ventas
                           (id_venta,id_producto,cantidad,precio_unitario,subtotal,nombre_producto,codigo_barras)
@@ -319,7 +330,8 @@ def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
             if datos.borrador_revision:
                 c.execute('DELETE FROM carritos_usuario WHERE id_usuario=%s AND id_empresa=%s AND revision=%s',
                           (s['id_usuario'],s['id_empresa'],str(datos.borrador_revision)))
-        return {'id_venta':id_venta,'numero_comprobante':comprobante,'total':float(total),'repetida':False}
+        return {'id_venta':id_venta,'numero_comprobante':comprobante,'total':float(total),
+                'monto_recibido':float(recibido),'cambio':float(cambio),'repetida':False}
 
     def filtros_ventas(s, q='', empleado=None, estado='', desde=None, hasta=None):
         where, args = ambito(s)
@@ -371,6 +383,9 @@ def instalar_rutas(app, obtener_conexion, sesion_activa, sesion_identificada,
             venta['empresa'] = una(c,'SELECT nombre_comercial,nit,direccion,telefono FROM empresas WHERE id_empresa=%s',(s['id_empresa'],))
         venta.pop('solicitud_hash',None)
         return {'venta':venta,'productos':productos}
+
+    from correo_comprobantes import instalar_correo
+    instalar_correo(app, db, ambito, comprobante, sesion_activa, correo_config)
 
     @app.post('/api/ventas/{id_venta}/anular')
     def anular(id_venta: int,s=Depends(requerir_admin)):

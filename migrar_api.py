@@ -53,6 +53,14 @@ TABLAS = [
  id_usuario INT PRIMARY KEY,id_empresa INT NOT NULL,revision VARCHAR(36) NOT NULL,contenido JSON NOT NULL,
  FOREIGN KEY(id_usuario) REFERENCES usuarios(id_usuario)
 ) ENGINE=InnoDB''',
+'''CREATE TABLE IF NOT EXISTS comprobantes_correo (
+ id_envio CHAR(36) PRIMARY KEY,id_venta INT NOT NULL,id_empresa INT NOT NULL,
+ correo VARCHAR(254) NOT NULL,estado VARCHAR(20) NOT NULL,intentos INT NOT NULL DEFAULT 1,
+ mensaje_id VARCHAR(255) NULL,detalle VARCHAR(255) NULL,
+ fecha_actualizacion DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE KEY uq_comprobante_destinatario (id_venta,correo),
+ FOREIGN KEY(id_venta) REFERENCES ventas(id_venta)
+) ENGINE=InnoDB''',
 ]
 
 NUEVAS={
@@ -60,7 +68,8 @@ NUEVAS={
              'contrasena_actualizada_en':'DATETIME NULL'},
  'productos':{'id_empresa':'INT NULL','version':'INT NOT NULL DEFAULT 1','imagen':'MEDIUMTEXT NULL'},
  'ventas':{'id_empresa':'INT NULL','solicitud_id':'VARCHAR(36) NULL','solicitud_hash':'CHAR(64) NULL',
-           'cliente_nombre':"VARCHAR(120) NOT NULL DEFAULT ''"},
+           'cliente_nombre':"VARCHAR(120) NOT NULL DEFAULT ''",'cliente_correo':'VARCHAR(254) NULL',
+           'monto_recibido':'DECIMAL(12,2) NULL','cambio':'DECIMAL(12,2) NULL'},
  'detalle_ventas':{'nombre_producto':'VARCHAR(150) NULL','codigo_barras':'VARCHAR(60) NULL'},
  'movimientos_inventario':{'id_venta':'INT NULL'},
 }
@@ -94,6 +103,7 @@ def ejecutar(aplicar=False, empresa=None, recursos=None):
         nombres={next(iter(r.values())) for r in c.fetchall()}
         if not aplicar:
             print('Conexión correcta. Tablas: '+', '.join(sorted(nombres)))
+            print('Tabla de comprobantes por correo: '+('ya existe' if 'comprobantes_correo' in nombres else 'por crear'))
             for tabla,campos in NUEVAS.items():
                 cols=columnas(c,tabla) if tabla in nombres else {}
                 print(tabla+': columnas por agregar = '+', '.join(k for k in campos if k not in cols))

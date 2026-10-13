@@ -205,18 +205,11 @@ def requerir_administrador(
 def preparar_esquema_usuarios():
     conexion = obtener_conexion()
     cursor = None
-
     try:
+        # Consume automáticamente cada resultado, incluso los SELECT sin filas.
         cursor = conexion.cursor(buffered=True)
-
-        cursor.execute(
-            "SELECT auth_version FROM usuarios LIMIT 0"
-        )
-
-        cursor.execute(
-            "SELECT id_empresa, version FROM productos LIMIT 0"
-        )
-
+        cursor.execute('SELECT auth_version FROM usuarios LIMIT 0')
+        cursor.execute('SELECT id_empresa,version FROM productos LIMIT 0')
     finally:
         try:
             if cursor is not None:
@@ -752,7 +745,7 @@ async def lifespan(_app: FastAPI):
     try:
         preparar_esquema_usuarios()
     except Error as error:
-        logger.error("No se pudo preparar la tabla usuarios: %s", error)
+        logger.error("No se pudo comprobar el esquema de la base: %s", error)
 
     if not JWT_SECRET:
         logger.warning("JWT_SECRET no esta configurada; el login no emitira tokens.")
@@ -1577,4 +1570,4 @@ from fastapi import Response
 from negocio_api import instalar_rutas
 instalar_rutas(app,obtener_conexion,obtener_sesion_actual,obtener_sesion_identificada,
                requerir_administrador,generar_hash_contrasena,verificar_hash_contrasena,
-               generar_token_acceso,notificar_cambio)
+               generar_token_acceso,notificar_cambio,correo_config=BREVO_CONFIG)

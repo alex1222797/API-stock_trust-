@@ -6,3 +6,4 @@ pydantic[email]>=2.10,<3
 PyJWT>=2.10,<3
 requests>=2.32,<3
 Pillow>=11,<13
+reportlab>=4,<6
