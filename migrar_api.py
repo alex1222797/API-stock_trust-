@@ -74,6 +74,11 @@ NUEVAS={
  'movimientos_inventario':{'id_venta':'INT NULL'},
 }
 
+TIPOS_REQUERIDOS = {
+    'ventas': {'numero_comprobante': 'varchar(80)'},
+    'movimientos_inventario': {'tipo': 'varchar(30)'},
+}
+
 
 def columnas(c,tabla):
     c.execute(f'SHOW COLUMNS FROM `{tabla}`')
@@ -107,6 +112,11 @@ def ejecutar(aplicar=False, empresa=None, recursos=None):
             for tabla,campos in NUEVAS.items():
                 cols=columnas(c,tabla) if tabla in nombres else {}
                 print(tabla+': columnas por agregar = '+', '.join(k for k in campos if k not in cols))
+            for tabla,campos in TIPOS_REQUERIDOS.items():
+                cols=columnas(c,tabla) if tabla in nombres else {}
+                pendientes=[f"{campo} -> {tipo}" for campo,tipo in campos.items()
+                            if campo in cols and cols[campo]['Type'].lower()!=tipo]
+                print(tabla+': tipos por corregir = '+', '.join(pendientes))
             if 'productos' in nombres:
                 cols=columnas(c,'productos')
                 c.execute('SELECT COUNT(*) cantidad FROM productos'+(' WHERE id_empresa IS NULL' if 'id_empresa' in cols else ''))
@@ -121,6 +131,12 @@ def ejecutar(aplicar=False, empresa=None, recursos=None):
             for nombre,tipo in campos.items():
                 if nombre not in cols:
                     c.execute(f'ALTER TABLE `{tabla}` ADD COLUMN `{nombre}` {tipo}')
+        for tabla,campos in TIPOS_REQUERIDOS.items():
+            cols=columnas(c,tabla)
+            for nombre,tipo in campos.items():
+                if cols[nombre]['Type'].lower()!=tipo:
+                    nulo='NULL' if cols[nombre]['Null']=='YES' else 'NOT NULL'
+                    c.execute(f'ALTER TABLE `{tabla}` MODIFY `{nombre}` {tipo.upper()} {nulo}')
         for tabla,campo in (('productos','imagen'),('usuarios','foto')):
             tipo=columnas(c,tabla)[campo]['Type'].lower()
             if tipo not in ('mediumtext','longtext'):

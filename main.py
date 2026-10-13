@@ -18,6 +18,7 @@ import secrets
 import string
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 
 def ahora_local():
@@ -30,8 +31,10 @@ import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from mysql.connector import Error, IntegrityError
+from mysql.connector.pooling import MySQLConnectionPool
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -64,6 +67,10 @@ DB_CONFIG = {
     "connection_timeout": int(os.getenv("MYSQL_CONNECT_TIMEOUT", "15")),
 }
 
+DB_POOL_SIZE = max(2, min(int(os.getenv("MYSQL_POOL_SIZE", "6")), 20))
+_DB_POOL = None
+_DB_POOL_LOCK = Lock()
+
 mysql_ssl_ca = os.getenv("MYSQL_SSL_CA", "").strip()
 if mysql_ssl_ca:
     DB_CONFIG.update({"ssl_ca": mysql_ssl_ca, "ssl_verify_cert": True, "ssl_verify_identity": True})
@@ -86,7 +93,20 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 # =============================================================================
 
 def obtener_conexion():
-    conexion = mysql.connector.connect(**DB_CONFIG)
+    global _DB_POOL
+    if _DB_POOL is None:
+        with _DB_POOL_LOCK:
+            if _DB_POOL is None:
+                _DB_POOL = MySQLConnectionPool(
+                    pool_name="stocktrust_pool",
+                    pool_size=DB_POOL_SIZE,
+                    pool_reset_session=True,
+                    **DB_CONFIG,
+                )
+                logger.info("Pool MySQL preparado con %s conexiones.", DB_POOL_SIZE)
+
+    conexion = _DB_POOL.get_connection()
+    conexion.ping(reconnect=True, attempts=2, delay=0)
     cursor = conexion.cursor()
     try:
         cursor.execute("SET time_zone = '-06:00'")
@@ -780,6 +800,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 
 # =============================================================================
